@@ -1,0 +1,11 @@
+{{ template "_header.html" . }}
+    <h2>Welcome to the chats planet</h2>
+    <h3>Join Existing one:</h3>
+    <ul>
+        {{ range .Content.Chats }}
+            <li><a href="/chats/show/{{.ID}}">{{.Name}}</a></li>
+        {{ end }}
+    </ul>
+
+    <a href="/chats/new">Create Your Own</a>
+{{ template "_footer.html" . }}
