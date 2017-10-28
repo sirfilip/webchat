@@ -1,14 +1,14 @@
 {{ template "_header.html" . }}
 <h2>Create New Chat</h2>
+<ul class="form_errors list-unstyled">
+    {{ range .Errors }}
+        <li>{{ . }}</li>    
+    {{ end }}
+</ul>
 <form action="" method="post">
-    <ul class="form_errors list-unstyled">
-        {{ range .errors }}
-            <li>{{ . }}</li>    
-        {{ end }}
-    </ul>
     <div class="form-group">
         <label for="chat_name">Chat Name</label>
-        <input type="text" name="chat_name" id="chat_name" value="{{ .chat.Name }}" />
+        <input type="text" name="chat_name" id="chat_name" value="{{ .Content.Chat.Name }}" />
     </div>
     <input type="submit" class="btn btn-default" value="Submit" />
 </form>

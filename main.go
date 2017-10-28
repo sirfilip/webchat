@@ -26,6 +26,26 @@ func encrypt(value string) string {
 	return string(h.Sum(nil))
 }
 
+func createSchema(db *sql.DB) {
+	if _, err := db.Exec(`
+		CREATE TABLE chats ( 
+			id INTEGER PRIMARY KEY AUTOINCREMENT, 
+			name TEXT 
+		)
+	`); err != nil {
+		panic(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE users ( 
+			id INTEGER PRIMARY KEY AUTOINCREMENT, 
+			username TEXT UNIQUE, 
+			password TEXT NOT NULL 
+		)
+	`); err != nil {
+		panic(err)
+	}
+}
+
 // models
 type Chat struct {
 	ID   int64
@@ -176,11 +196,13 @@ func NewPage(title string) Page {
 
 // main
 func main() {
-	db, err := sql.Open("sqlite3", "./db/dev.sqlite")
+	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
+
+	createSchema(db)
 
 	templates = template.Must(template.ParseGlob("templates/*.html"))
 
