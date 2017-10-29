@@ -26,11 +26,11 @@
             console.log(e);
             var message = JSON.parse(e.data);
             $('#chat-messages').append("<li><b>" + message.Username + ":</b>" + message.Body + "</li>")
-            $('#message_body').val('');
         });
         $('#chat-form').submit(function(e) {
             var $this = $(this);
             e.preventDefault();
+            $('#message_body').val('');
             $.post("/messages/create", $this.serialize())
                 .done(function(data) {
                     console.log(data);
