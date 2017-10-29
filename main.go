@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 
+	"github.com/asaskevich/govalidator"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	_ "github.com/mattn/go-sqlite3"
@@ -22,12 +25,13 @@ const SESSION_NAME string = "default"
 var store = sessions.NewCookieStore([]byte("my super duper secret"))
 var conn *sql.DB
 var templates *template.Template
+var logger *log.Logger = log.New(os.Stdout, "APPLOG:", log.Ldate|log.Ltime|log.Lshortfile)
 
 // init
 func db() *sql.DB {
 	var err error
 	if conn == nil {
-		fmt.Println("Connecting to db")
+		log.Println("Connecting to db")
 		conn, err = sql.Open("sqlite3", ":memory:")
 		if err != nil {
 			panic(err)
@@ -64,7 +68,7 @@ func createSchema(db *sql.DB) {
 	if _, err := db.Exec(`
 		CREATE TABLE chats ( 
 			id INTEGER PRIMARY KEY AUTOINCREMENT, 
-			name TEXT 
+			name TEXT UNIQUE 
 		)
 	`); err != nil {
 		panic(err)
@@ -234,6 +238,80 @@ func NewPage(title string) Page {
 	return Page{Title: title, Content: content}
 }
 
+// forms
+
+type RegistrationForm struct {
+	Username string  `valid:"required,length(4|50),alphanum"`
+	Password string  `valid:"required,length(4|50)"`
+	Errors   []error `valid:"-"`
+}
+
+func (this *RegistrationForm) Submit(username, password string) bool {
+	this.Username = username
+	this.Password = password
+	this.Errors = make([]error, 0)
+	if this.isValid() {
+		_, err := UserRepo(db()).Register(username, password)
+		if err != nil {
+			this.Errors = append(this.Errors, err)
+			return false
+		}
+		return true
+	} else {
+		return false
+	}
+}
+
+func (this *RegistrationForm) isValid() bool {
+	var total int
+	_, err := govalidator.ValidateStruct(this)
+	if err != nil {
+		this.Errors = append(this.Errors, err)
+	}
+	if err = db().QueryRow("SELECT count(*) as total FROM users WHERE username = ?", this.Username).Scan(&total); err != nil {
+		logger.Println("Failed to validate user", err)
+		this.Errors = append(this.Errors, errors.New("Problem in validating user."))
+	}
+	if total > 0 {
+		this.Errors = append(this.Errors, errors.New("Username is already taken."))
+	}
+	return len(this.Errors) == 0
+}
+
+type CreateChatForm struct {
+	Name   string  `valid:"required,alphanum,length(4|50)"`
+	Errors []error `valid:"-"`
+}
+
+func (this *CreateChatForm) Submit(name string) bool {
+	this.Errors = make([]error, 0)
+	this.Name = name
+	if this.isValid() {
+		chat := &Chat{Name: this.Name}
+		ChatRepo(db()).Save(chat)
+		return true
+	} else {
+		return false
+	}
+}
+
+func (this *CreateChatForm) isValid() bool {
+	var total int
+	_, err := govalidator.ValidateStruct(this)
+	if err != nil {
+		this.Errors = append(this.Errors, err)
+	}
+	if err = db().QueryRow("SELECT count(*) as total FROM chats WHERE name = ?", this.Name).Scan(&total); err != nil {
+		logger.Println("There was an error in validating chat", err)
+		this.Errors = append(this.Errors, errors.New("Problem in validating chat."))
+	}
+
+	if total > 0 {
+		this.Errors = append(this.Errors, errors.New("Chat name is already taken."))
+	}
+	return len(this.Errors) == 0
+}
+
 // middlewares
 
 func LoginRequired(h http.HandlerFunc) http.HandlerFunc {
@@ -271,10 +349,14 @@ func ChatNew(w http.ResponseWriter, r *http.Request) {
 	page.User = current_user(r)
 	chat := &Chat{}
 	if r.Method == "POST" {
-		chat.Name = r.FormValue("chat_name")
-		ChatRepo(db()).Save(chat)
-		http.Redirect(w, r, "/", 301)
-		return
+		form := &CreateChatForm{}
+		name := r.FormValue("chat_name")
+		if form.Submit(name) {
+			http.Redirect(w, r, "/", 301)
+			return
+		} else {
+			page.Errors = append(page.Errors, form.Errors...)
+		}
 	}
 	page.Content["Chat"] = chat
 	templates.ExecuteTemplate(w, "new.html", page)
@@ -303,12 +385,12 @@ func Register(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		username := r.FormValue("username")
 		password := r.FormValue("password")
-		_, err := UserRepo(db()).Register(username, password)
-		if err == nil {
+		form := &RegistrationForm{}
+		if form.Submit(username, password) {
 			http.Redirect(w, r, "/", 301)
 			return
 		}
-		page.Errors = append(page.Errors, err)
+		page.Errors = append(page.Errors, form.Errors...)
 	}
 	templates.ExecuteTemplate(w, "register.html", page)
 }
@@ -367,5 +449,6 @@ func main() {
 
 	http.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("public"))))
 	http.Handle("/", router)
+	log.Println("Server up and running on http://localhost:8000")
 	http.ListenAndServe(":8000", nil)
 }
