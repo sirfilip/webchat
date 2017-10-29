@@ -11,12 +11,101 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/asaskevich/govalidator"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
+	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// collections
+type ThreadSafeWebSocketCollection struct {
+	sync.Mutex
+	webSockets map[*websocket.Conn]bool
+}
+
+func (this *ThreadSafeWebSocketCollection) Add(conn *websocket.Conn) *ThreadSafeWebSocketCollection {
+	this.Lock()
+	defer this.Unlock()
+	this.webSockets[conn] = true
+	return this
+}
+
+func (this *ThreadSafeWebSocketCollection) Remove(conn *websocket.Conn) *ThreadSafeWebSocketCollection {
+	this.Lock()
+	defer this.Unlock()
+	delete(this.webSockets, conn)
+	return this
+}
+
+func (this *ThreadSafeWebSocketCollection) ForEach(cb func(*websocket.Conn)) {
+	this.Lock()
+	defer this.Unlock()
+	for sock, _ := range this.webSockets {
+		cb(sock)
+	}
+}
+
+func NewThreadSafeWebSocketCollection() *ThreadSafeWebSocketCollection {
+	collection := &ThreadSafeWebSocketCollection{}
+	collection.webSockets = make(map[*websocket.Conn]bool)
+	return collection
+}
+
+type ThreadSafeClientCollection struct {
+	sync.Mutex
+	clients map[string]*ThreadSafeWebSocketCollection
+}
+
+func (this *ThreadSafeClientCollection) Add(client string) *ThreadSafeWebSocketCollection {
+	this.Lock()
+	defer this.Unlock()
+	if this.clients[client] == nil {
+		this.clients[client] = NewThreadSafeWebSocketCollection()
+	}
+	return this.clients[client]
+}
+
+func (this *ThreadSafeClientCollection) Fetch(client string) *ThreadSafeWebSocketCollection {
+	this.Lock()
+	defer this.Unlock()
+	return this.clients[client]
+}
+
+func NewThreadSafeClientCollection() *ThreadSafeClientCollection {
+	collection := &ThreadSafeClientCollection{}
+	collection.clients = make(map[string]*ThreadSafeWebSocketCollection)
+	return collection
+}
+
+type ThreadSafeChannelCollection struct {
+	sync.Mutex
+	channels map[string]chan *Message
+}
+
+func (this *ThreadSafeChannelCollection) Add(chat string) *ThreadSafeChannelCollection {
+	this.Lock()
+	defer this.Unlock()
+	if this.channels[chat] == nil {
+		this.channels[chat] = make(chan *Message)
+	}
+	return this
+}
+
+func (this *ThreadSafeChannelCollection) Fetch(chat string) chan *Message {
+	this.Lock()
+	defer this.Unlock()
+	return this.channels[chat]
+}
+
+func NewThreadSafeChannelCollection() *ThreadSafeChannelCollection {
+	collection := &ThreadSafeChannelCollection{}
+	collection.channels = make(map[string]chan *Message)
+	return collection
+}
 
 // const
 const SESSION_NAME string = "default"
@@ -26,13 +115,17 @@ var store = sessions.NewCookieStore([]byte("my super duper secret"))
 var conn *sql.DB
 var templates *template.Template
 var logger *log.Logger = log.New(os.Stdout, "APPLOG:", log.Ldate|log.Ltime|log.Lshortfile)
+var channels *ThreadSafeChannelCollection = NewThreadSafeChannelCollection()
+var clients *ThreadSafeClientCollection = NewThreadSafeClientCollection()
+var upgrader websocket.Upgrader = websocket.Upgrader{}
 
 // init
 func db() *sql.DB {
 	var err error
 	if conn == nil {
 		log.Println("Connecting to db")
-		conn, err = sql.Open("sqlite3", ":memory:")
+		// conn, err = sql.Open("sqlite3", ":memory:")
+		conn, err = sql.Open("sqlite3", "dev.sqlite")
 		if err != nil {
 			panic(err)
 		}
@@ -82,12 +175,32 @@ func createSchema(db *sql.DB) {
 	`); err != nil {
 		panic(err)
 	}
+	if _, err := db.Exec(`
+		CREATE TABLE messages ( 
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			username TEXT NOT NULL,
+			body TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		panic(err)
+	}
 }
 
 // models
+type Message struct {
+	ID        int64
+	Body      string
+	Username  string
+	ChatID    int64
+	CreatedAt time.Time
+}
+
 type Chat struct {
-	ID   int64
-	Name string
+	ID       int64
+	Name     string
+	Messages []*Message
 }
 
 type User struct {
@@ -124,7 +237,7 @@ func (this *chatRepo) FindAll() ([]*Chat, error) {
 		if err != nil {
 			return chats, err
 		}
-		chats = append(chats, &Chat{id, name})
+		chats = append(chats, &Chat{ID: id, Name: name})
 	}
 	return chats, nil
 }
@@ -171,14 +284,41 @@ func (this *chatRepo) update(chat *Chat) (*Chat, error) {
 }
 
 func (this *chatRepo) Find(uid int64) (*Chat, error) {
-	var name string
-	var id int64
+	var chat_name string
+	var username string
+	var body string
+	var message_id int64
+	var chat *Chat
 
-	err := this.db.QueryRow("SELECT id, name FROM chats WHERE id=?", uid).Scan(&id, &name)
+	rows, err := this.db.Query(`
+		SELECT 
+			chats.name as chat_name, 
+			messages.id, 
+			messages.username, 
+			messages.body
+		FROM chats 
+		LEFT OUTER JOIN messages on messages.chat_id = chats.id 
+		WHERE chats.id = ?
+		ORDER BY messages.id ASC
+	`, uid)
 	if err != nil {
 		return nil, err
 	}
-	return &Chat{id, name}, nil
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&chat_name, &message_id, &username, &body)
+		if chat == nil {
+			chat = &Chat{ID: uid, Name: chat_name}
+		}
+		if &message_id != nil { // there are messages available
+			chat.Messages = append(chat.Messages, &Message{
+				ID:       message_id,
+				Username: username,
+				Body:     body,
+			})
+		}
+	}
+	return chat, nil
 }
 
 type userRepo struct {
@@ -222,6 +362,33 @@ func (this *userRepo) FindByUsername(username string) (*User, error) {
 		return nil, err
 	}
 	return user, nil
+}
+
+type messageRepo struct {
+	db *sql.DB
+}
+
+func MessageRepo(db *sql.DB) *messageRepo {
+	return &messageRepo{db}
+}
+
+func (this *messageRepo) Create(username, body string, chatID int64) (*Message, error) {
+	stmt, err := this.db.Prepare("INSERT INTO messages (username, body, chat_id, created_at) VALUES (?, ?, ?, ?)")
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	nowFormatted := time.Now().Format(time.RFC3339)
+	result, err := stmt.Exec(username, body, chatID, nowFormatted)
+	if err != nil {
+		return nil, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &Message{ID: id, Username: username, ChatID: chatID, Body: body, CreatedAt: now}, nil
+
 }
 
 // view models
@@ -289,6 +456,9 @@ func (this *CreateChatForm) Submit(name string) bool {
 	if this.isValid() {
 		chat := &Chat{Name: this.Name}
 		ChatRepo(db()).Save(chat)
+		chatID := strconv.FormatInt(chat.ID, 10)
+		channels.Add(chatID)
+		clients.Add(chatID)
 		return true
 	} else {
 		return false
@@ -308,6 +478,45 @@ func (this *CreateChatForm) isValid() bool {
 
 	if total > 0 {
 		this.Errors = append(this.Errors, errors.New("Chat name is already taken."))
+	}
+	return len(this.Errors) == 0
+}
+
+type CreateMessageForm struct {
+	Username string   `valid:"required"`
+	ChatID   int64    `valid:"required"`
+	Body     string   `valid:"required,length(1|256)"`
+	Errors   []error  `valid:"-"`
+	Message  *Message `valid:"-"`
+}
+
+func (this *CreateMessageForm) Submit(username string, chatID string, messageBody string) bool {
+	this.Errors = make([]error, 0)
+	this.Username = username
+	this.Body = messageBody
+	chatID64, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		this.Errors = append(this.Errors, err)
+	} else {
+		this.ChatID = chatID64
+	}
+	if this.isValid() {
+		message, err := MessageRepo(db()).Create(username, messageBody, chatID64)
+		if err != nil {
+			this.Errors = append(this.Errors, err)
+			return false
+		}
+		this.Message = message
+		return true
+	} else {
+		return false
+	}
+}
+
+func (this *CreateMessageForm) isValid() bool {
+	_, err := govalidator.ValidateStruct(this)
+	if err != nil {
+		this.Errors = append(this.Errors, err)
 	}
 	return len(this.Errors) == 0
 }
@@ -431,10 +640,51 @@ func Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", 301)
 }
 
+func CreateMessage(w http.ResponseWriter, r *http.Request) {
+	user := current_user(r)
+	if r.Method == "POST" {
+		form := &CreateMessageForm{}
+		chatID := r.FormValue("chat_id")
+		messageBody := r.FormValue("message_body")
+		if form.Submit(user.Username, chatID, messageBody) {
+			go func() {
+				clients.Fetch(chatID).ForEach(func(ws *websocket.Conn) {
+					channels.Fetch(chatID) <- form.Message
+				})
+			}()
+			// notify success
+			w.WriteHeader(http.StatusCreated)
+		} else {
+			// notify failure
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}
+}
+
+func WS(w http.ResponseWriter, r *http.Request) {
+	chatID := r.FormValue("chat_id")
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	wsCollection := clients.Fetch(chatID)
+	for {
+		message := <-channels.Fetch(chatID)
+		err := ws.WriteJSON(message)
+		if err != nil {
+			if wsCollection != nil {
+				wsCollection.Remove(ws)
+			}
+			break
+		}
+	}
+}
+
 // main
 func main() {
 	defer db().Close()
-	createSchema(db())
+	// createSchema(db())
 
 	templates = template.Must(template.ParseGlob("templates/*.html"))
 

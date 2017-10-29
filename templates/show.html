@@ -1,5 +1,21 @@
 {{ template "_header.html" . }}
 
-The chat
+<h2>{{ .Content.Chat.Name }}</h2>
+
+<ul class="chat-messages">
+    {{ range .Content.Chat.Messages }}
+    <li><b>{{ .Username }}:</b> {{ .Body }}</li>
+    {{ end }}
+</ul>
+
+
+<form action="messages/create" method="post">
+    <input type="hidden" name="chat_id" value="{{ .Content.Chat.ID }}" />
+    <div class="form-group">
+        <label for="message_body">Message</label>
+        <textarea name="message_body" id="message_body" class="form-control"></textarea>
+    </div>
+    <input type="submit" value="Send" class="btn btn-default" />
+</form>
 
 {{ template "_footer.html" }}
