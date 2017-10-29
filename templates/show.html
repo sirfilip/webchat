@@ -30,9 +30,9 @@
         $('#chat-form').submit(function(e) {
             var $this = $(this);
             e.preventDefault();
-            $('#message_body').val('');
             $.post("/messages/create", $this.serialize())
                 .done(function(data) {
+                    $('#message_body').val('');
                     console.log(data);
                 });
         });

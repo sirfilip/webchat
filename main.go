@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/asaskevich/govalidator"
@@ -22,88 +21,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// collections
-type ThreadSafeWebSocketCollection struct {
-	sync.Mutex
-	webSockets map[*websocket.Conn]bool
-}
-
-func (this *ThreadSafeWebSocketCollection) Add(conn *websocket.Conn) *ThreadSafeWebSocketCollection {
-	this.Lock()
-	defer this.Unlock()
-	this.webSockets[conn] = true
-	return this
-}
-
-func (this *ThreadSafeWebSocketCollection) Remove(conn *websocket.Conn) *ThreadSafeWebSocketCollection {
-	this.Lock()
-	defer this.Unlock()
-	delete(this.webSockets, conn)
-	return this
-}
-
-func (this *ThreadSafeWebSocketCollection) ForEach(cb func(*websocket.Conn)) {
-	this.Lock()
-	defer this.Unlock()
-	for sock, _ := range this.webSockets {
-		cb(sock)
-	}
-}
-
-func NewThreadSafeWebSocketCollection() *ThreadSafeWebSocketCollection {
-	collection := &ThreadSafeWebSocketCollection{}
-	collection.webSockets = make(map[*websocket.Conn]bool)
-	return collection
-}
-
-type ThreadSafeClientCollection struct {
-	sync.Mutex
-	clients map[string]*ThreadSafeWebSocketCollection
-}
-
-func (this *ThreadSafeClientCollection) Add(client string) *ThreadSafeWebSocketCollection {
-	this.Lock()
-	defer this.Unlock()
-	this.clients[client] = NewThreadSafeWebSocketCollection()
-	return this.clients[client]
-}
-
-func (this *ThreadSafeClientCollection) Fetch(client string) *ThreadSafeWebSocketCollection {
-	this.Lock()
-	defer this.Unlock()
-	return this.clients[client]
-}
-
-func NewThreadSafeClientCollection() *ThreadSafeClientCollection {
-	collection := &ThreadSafeClientCollection{}
-	collection.clients = make(map[string]*ThreadSafeWebSocketCollection)
-	return collection
-}
-
-type ThreadSafeChannelCollection struct {
-	sync.Mutex
-	channels map[string]chan *Message
-}
-
-func (this *ThreadSafeChannelCollection) Add(chat string) *ThreadSafeChannelCollection {
-	this.Lock()
-	defer this.Unlock()
-	this.channels[chat] = make(chan *Message)
-	return this
-}
-
-func (this *ThreadSafeChannelCollection) Fetch(chat string) chan *Message {
-	this.Lock()
-	defer this.Unlock()
-	return this.channels[chat]
-}
-
-func NewThreadSafeChannelCollection() *ThreadSafeChannelCollection {
-	collection := &ThreadSafeChannelCollection{}
-	collection.channels = make(map[string]chan *Message)
-	return collection
-}
-
 // const
 const SESSION_NAME string = "default"
 
@@ -112,8 +29,8 @@ var store = sessions.NewCookieStore([]byte("my super duper secret"))
 var conn *sql.DB
 var templates *template.Template
 var logger *log.Logger = log.New(os.Stdout, "APPLOG:", log.Ldate|log.Ltime|log.Lshortfile)
-var channels *ThreadSafeChannelCollection = NewThreadSafeChannelCollection()
-var clients *ThreadSafeClientCollection = NewThreadSafeClientCollection()
+var messageChan chan *Message = make(chan *Message)
+var wsChan chan *WebSocketTransport = make(chan *WebSocketTransport)
 var upgrader websocket.Upgrader = websocket.Upgrader{}
 
 // init
@@ -149,7 +66,7 @@ func current_user(r *http.Request) *User {
 	}
 	user, err := UserRepo(db()).Find(user_id64)
 	if err != nil {
-		fmt.Println(err)
+		logger.Println(err)
 	}
 	return user
 }
@@ -402,6 +319,11 @@ func NewPage(title string) Page {
 	return Page{Title: title, Content: content}
 }
 
+type WebSocketTransport struct {
+	Socket *websocket.Conn
+	ChatID string
+}
+
 // forms
 
 type RegistrationForm struct {
@@ -455,9 +377,6 @@ func (this *CreateChatForm) Submit(name string) bool {
 		chat := &Chat{Name: this.Name}
 		this.Chat = chat
 		ChatRepo(db()).Save(chat)
-		chatID := strconv.FormatInt(chat.ID, 10)
-		channels.Add(chatID)
-		clients.Add(chatID)
 		return true
 	} else {
 		return false
@@ -647,9 +566,7 @@ func CreateMessage(w http.ResponseWriter, r *http.Request) {
 		messageBody := r.FormValue("message_body")
 		if form.Submit(user.Username, chatID, messageBody) {
 			go func() {
-				clients.Fetch(chatID).ForEach(func(ws *websocket.Conn) {
-					channels.Fetch(chatID) <- form.Message
-				})
+				messageChan <- form.Message
 			}()
 			// notify success
 			res, _ := json.Marshal(form.Message)
@@ -673,23 +590,42 @@ func WS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	wsCollection := clients.Fetch(chatID)
-	wsCollection.Add(ws)
-	for {
-		message := <-channels.Fetch(chatID)
-		err := ws.WriteJSON(message)
-		if err != nil {
-			logger.Println(err)
-			if wsCollection != nil {
-				wsCollection.Remove(ws)
-			}
-			break
-		}
-	}
+	go func() {
+		wsChan <- &WebSocketTransport{Socket: ws, ChatID: chatID}
+	}()
 }
+
+type WebsocketsMap map[*websocket.Conn]bool
 
 // main
 func main() {
+
+	go func() {
+		var sockets map[string]WebsocketsMap = make(map[string]WebsocketsMap)
+		var socketsForRemoval []*websocket.Conn = make([]*websocket.Conn, 0)
+		for {
+			select {
+			case msg := <-messageChan:
+				chatID := strconv.FormatInt(msg.ChatID, 10)
+				for ws, _ := range sockets[chatID] {
+					err := ws.WriteJSON(msg)
+					if err != nil {
+						socketsForRemoval = append(socketsForRemoval, ws)
+					}
+				}
+				for _, socketForRemoval := range socketsForRemoval {
+					delete(sockets[chatID], socketForRemoval)
+					socketForRemoval.Close()
+				}
+			case socketTransport := <-wsChan:
+				if sockets[socketTransport.ChatID] == nil {
+					sockets[socketTransport.ChatID] = make(map[*websocket.Conn]bool)
+				}
+				sockets[socketTransport.ChatID][socketTransport.Socket] = true
+			}
+		}
+	}()
+
 	defer db().Close()
 	createSchema(db())
 
