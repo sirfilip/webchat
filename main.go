@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -63,9 +64,7 @@ type ThreadSafeClientCollection struct {
 func (this *ThreadSafeClientCollection) Add(client string) *ThreadSafeWebSocketCollection {
 	this.Lock()
 	defer this.Unlock()
-	if this.clients[client] == nil {
-		this.clients[client] = NewThreadSafeWebSocketCollection()
-	}
+	this.clients[client] = NewThreadSafeWebSocketCollection()
 	return this.clients[client]
 }
 
@@ -89,9 +88,7 @@ type ThreadSafeChannelCollection struct {
 func (this *ThreadSafeChannelCollection) Add(chat string) *ThreadSafeChannelCollection {
 	this.Lock()
 	defer this.Unlock()
-	if this.channels[chat] == nil {
-		this.channels[chat] = make(chan *Message)
-	}
+	this.channels[chat] = make(chan *Message)
 	return this
 }
 
@@ -124,8 +121,8 @@ func db() *sql.DB {
 	var err error
 	if conn == nil {
 		log.Println("Connecting to db")
-		// conn, err = sql.Open("sqlite3", ":memory:")
-		conn, err = sql.Open("sqlite3", "dev.sqlite")
+		conn, err = sql.Open("sqlite3", ":memory:")
+		// conn, err = sql.Open("sqlite3", "dev.sqlite")
 		if err != nil {
 			panic(err)
 		}
@@ -448,6 +445,7 @@ func (this *RegistrationForm) isValid() bool {
 type CreateChatForm struct {
 	Name   string  `valid:"required,alphanum,length(4|50)"`
 	Errors []error `valid:"-"`
+	Chat   *Chat   `valid:"-"`
 }
 
 func (this *CreateChatForm) Submit(name string) bool {
@@ -455,6 +453,7 @@ func (this *CreateChatForm) Submit(name string) bool {
 	this.Name = name
 	if this.isValid() {
 		chat := &Chat{Name: this.Name}
+		this.Chat = chat
 		ChatRepo(db()).Save(chat)
 		chatID := strconv.FormatInt(chat.ID, 10)
 		channels.Add(chatID)
@@ -561,7 +560,7 @@ func ChatNew(w http.ResponseWriter, r *http.Request) {
 		form := &CreateChatForm{}
 		name := r.FormValue("chat_name")
 		if form.Submit(name) {
-			http.Redirect(w, r, "/", 301)
+			http.Redirect(w, r, fmt.Sprintf("/chats/show/%d", form.Chat.ID), 301)
 			return
 		} else {
 			page.Errors = append(page.Errors, form.Errors...)
@@ -642,8 +641,8 @@ func Logout(w http.ResponseWriter, r *http.Request) {
 
 func CreateMessage(w http.ResponseWriter, r *http.Request) {
 	user := current_user(r)
+	form := &CreateMessageForm{}
 	if r.Method == "POST" {
-		form := &CreateMessageForm{}
 		chatID := r.FormValue("chat_id")
 		messageBody := r.FormValue("message_body")
 		if form.Submit(user.Username, chatID, messageBody) {
@@ -653,11 +652,17 @@ func CreateMessage(w http.ResponseWriter, r *http.Request) {
 				})
 			}()
 			// notify success
+			res, _ := json.Marshal(form.Message)
 			w.WriteHeader(http.StatusCreated)
+			w.Write(res)
 		} else {
 			// notify failure
+			res, _ := json.Marshal(form.Errors)
 			w.WriteHeader(http.StatusBadRequest)
+			w.Write(res)
 		}
+	} else {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -669,10 +674,12 @@ func WS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wsCollection := clients.Fetch(chatID)
+	wsCollection.Add(ws)
 	for {
 		message := <-channels.Fetch(chatID)
 		err := ws.WriteJSON(message)
 		if err != nil {
+			logger.Println(err)
 			if wsCollection != nil {
 				wsCollection.Remove(ws)
 			}
@@ -684,7 +691,7 @@ func WS(w http.ResponseWriter, r *http.Request) {
 // main
 func main() {
 	defer db().Close()
-	// createSchema(db())
+	createSchema(db())
 
 	templates = template.Must(template.ParseGlob("templates/*.html"))
 
@@ -693,6 +700,8 @@ func main() {
 	router.HandleFunc("/", LoginRequired(Home))
 	router.HandleFunc("/chats/new", LoginRequired(ChatNew))
 	router.HandleFunc("/chats/show/{id}", LoginRequired(ChatShow))
+	router.HandleFunc("/messages/create", LoginRequired(CreateMessage))
+	router.HandleFunc("/ws", LoginRequired(WS))
 	router.HandleFunc("/register", Register)
 	router.HandleFunc("/login", Login)
 	router.HandleFunc("/logout", LoginRequired(Logout))

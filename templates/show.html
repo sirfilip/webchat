@@ -2,14 +2,14 @@
 
 <h2>{{ .Content.Chat.Name }}</h2>
 
-<ul class="chat-messages">
+<ul id="chat-messages">
     {{ range .Content.Chat.Messages }}
     <li><b>{{ .Username }}:</b> {{ .Body }}</li>
     {{ end }}
 </ul>
 
 
-<form action="messages/create" method="post">
+<form action="/messages/create" method="post" id="chat-form">
     <input type="hidden" name="chat_id" value="{{ .Content.Chat.ID }}" />
     <div class="form-group">
         <label for="message_body">Message</label>
@@ -17,5 +17,26 @@
     </div>
     <input type="submit" value="Send" class="btn btn-default" />
 </form>
+
+
+<script type="text/javascript">
+    $(function() {
+        var ws = new WebSocket("ws://localhost:8000/ws?chat_id={{.Content.Chat.ID}}")
+        ws.addEventListener('message', function(e) {
+            console.log(e);
+            var message = JSON.parse(e.data);
+            $('#chat-messages').append("<li><b>" + message.Username + ":</b>" + message.Body + "</li>")
+            $('#message_body').val('');
+        });
+        $('#chat-form').submit(function(e) {
+            var $this = $(this);
+            e.preventDefault();
+            $.post("/messages/create", $this.serialize())
+                .done(function(data) {
+                    console.log(data);
+                });
+        });
+    })
+</script>
 
 {{ template "_footer.html" }}
